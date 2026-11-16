@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+openai
+pydantic
+pyactup
+uniface[cpu]   # CPU / Apple Silicon; mit NVIDIA-GPU stattdessen uniface[gpu]
+opencv-python
+numpy
+# nur fuer test_backend.py / plotten.py
+requests
+matplotlib

@@ -1,0 +1,11 @@
+<resources>
+    <!-- Base application theme (AppCompat, nicht MaterialComponents). -->
+    <style name="Theme.Pepper_Eventplaner" parent="Theme.AppCompat.Light.DarkActionBar">
+        <!-- Primärfarbe -->
+        <item name="colorPrimary">@color/purple_500</item>
+        <!-- Dunklere Variante (Statusbar) -->
+        <item name="colorPrimaryDark">@color/purple_700</item>
+        <!-- Akzentfarbe (Buttons etc.) -->
+        <item name="colorAccent">@color/teal_200</item>
+    </style>
+</resources>

@@ -1,0 +1,5 @@
+personen_register.json
+actup_gedaechtnis.json
+*.tmp
+.venv/
+__pycache__/
