@@ -262,11 +262,28 @@ class PersonenErinnerung:
     # ---------- Speichern / Laden ----------
 
     @staticmethod
-    def _schreibe_json(pfad, daten, einrueckung=None):
+    def _schreibe_text(pfad, text):
         tmp = pfad + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(daten, f, ensure_ascii=False, indent=einrueckung)
+            f.write(text)
         os.replace(tmp, pfad)  # erst fertig schreiben, dann ersetzen -> Datei nie halb kaputt
+
+    def _schreibe_json(self, pfad, daten, einrueckung=None):
+        self._schreibe_text(pfad, json.dumps(daten, ensure_ascii=False, indent=einrueckung))
+
+    def _schreibe_register(self, pfad):
+        """Eine Zeile pro Person: Name und Zeitpunkt vorne, Embedding hinten.
+        Bleibt gültiges JSON, laden() liest es unverändert."""
+        zeilen = []
+        for pid, d in self.register.personen.items():
+            eintrag = {
+                "name": d.get("name"),
+                "zuletzt_um": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["zuletzt"])),
+                "zuletzt": d["zuletzt"],
+                "embedding": [round(float(x), 6) for x in np.asarray(d["embedding"])],
+            }
+            zeilen.append(f"  {json.dumps(pid)}: {json.dumps(eintrag, ensure_ascii=False)}")
+        self._schreibe_text(pfad, "{\n" + ",\n".join(zeilen) + "\n}\n")
 
     def _uhrzeit(self, memory_minuten):
         """Memory-Zeit (Minuten seit Start) -> lesbare Uhrzeit."""
@@ -303,11 +320,7 @@ class PersonenErinnerung:
                     } for c in g.m.chunks],
                 }, einrueckung=2)
             if self.personen_datei:
-                self._schreibe_json(self.personen_datei, {
-                    pid: {"embedding": np.asarray(d["embedding"]).tolist(),
-                          "zuletzt": d["zuletzt"],
-                          "name": d.get("name")}
-                    for pid, d in self.register.personen.items()})
+                self._schreibe_register(self.personen_datei)
 
     def laden(self):
         """Beide Dateien laden, falls vorhanden (sonst leeres Gedächtnis)."""
