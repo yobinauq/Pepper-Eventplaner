@@ -183,10 +183,19 @@ def verlauf_merken(cid: str, role: str, text: str):
     history[cid] = eintraege[-VERLAUF_MAX_EINTRAEGE:]
 
 
-def verlauf_holen(cid: str) -> list[dict]:
+def verlaeufe_aufraeumen():
+    """Loescht bei ALLEN Personen Nachrichten, die aelter als VERLAUF_NACH_MINUTEN sind
+    (auch bei Personen, die nicht wiederkommen)."""
     grenze = time.time() - VERLAUF_NACH_MINUTEN * 60
-    return [{"role": e["role"], "content": e["content"]}
-            for e in history.get(cid, []) if e["ts"] >= grenze]
+    for cid in list(history):  # list(): Eintraege werden waehrend der Schleife geloescht
+        history[cid] = [e for e in history[cid] if e["ts"] >= grenze]
+        if not history[cid]:
+            del history[cid]
+
+
+def verlauf_holen(cid: str) -> list[dict]:
+    verlaeufe_aufraeumen()
+    return [{"role": e["role"], "content": e["content"]} for e in history.get(cid, [])]
 
 
 def _zahl(v, maximum: int) -> int | None:
