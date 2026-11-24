@@ -5,7 +5,7 @@ Ablauf: Bild -> vorderstes Gesicht (UniFace) -> person_id (PersonenRegister)
 
 Jeder Chunk hat dieselbe Form:
     {"person": "person_ab12", "attribut": "gaeste", "wert": 80}
-Einzelwerte (FAKTEN): der zuletzt gelernte aktive Chunk gilt.
+Einzelwerte (FAKTEN = zustand.EINZELWERTE): der zuletzt gelernte aktive Chunk gilt.
 Listen (wunsch, thema): alle aktiven Chunks gelten; "wunsch_entfernt" streicht einen Wunsch.
 
 Gespeichert wird nach jeder Änderung in ZWEI JSON-Dateien, die beim Start geladen werden:
@@ -45,8 +45,11 @@ PERSON_LOESCHEN_NACH_MINUTEN = 20160
 # Chunk-Tabelle nach jeder gemerkten Änderung ausgeben
 CHUNK_AUSGABE = True
 
-# Einzelwerte des Planungsstands (es gilt immer der neueste)
-FAKTEN = ["event_typ", "datum", "ort", "gaeste", "budget"]
+# Einzelwerte des Planungsstands (es gilt immer der neueste) - definiert im Zustandsraum
+from zustand import EINZELWERTE as FAKTEN  # noqa: E402
+
+# Alte Attributnamen aus früheren Versionen -> neue Namen (beim Laden umbenannt)
+UMBENENNUNG = {"gaeste": "personenzahl"}
 
 
 def bild_aus_base64(b64):
@@ -238,7 +241,7 @@ class PersonenErinnerung:
         return s
 
     def merke_aenderungen(self, person_id, daten):
-        """daten = bereinigtes Ergebnis von analysiere_aussage() (ohne name)."""
+        """daten = geprüfte Änderungen (Einzelwerte aus zustand.wende_an + Wünsche/Thema)."""
         with self.lock:
             g = self.gedachtnis
             for a in FAKTEN:
@@ -258,6 +261,22 @@ class PersonenErinnerung:
         with self.lock:
             self.register.setze_name(person_id, name)
             self.speichern()
+
+    def test_person(self, person_id):
+        """Nur zum Testen ohne Kamera (chat_test.py): feste person_id statt Gesichtserkennung.
+        Bekommt ein zufälliges Embedding, damit echte Gesichter sie nie treffen.
+        -> (person_id, neu, zuletzt_gesehen_vorher) wie erkenne()"""
+        with self.lock:
+            daten = self.register.personen.get(person_id)
+            if daten is None:
+                zufall = np.random.default_rng().uniform(-1, 1, 512).astype(np.float32)
+                self.register.personen[person_id] = {"embedding": zufall, "zuletzt": time.time()}
+                vorher, neu = None, True
+            else:
+                vorher, neu = daten["zuletzt"], False
+                daten["zuletzt"] = time.time()
+            self.speichern()
+        return person_id, neu, vorher
 
     # ---------- Speichern / Laden ----------
 
@@ -344,7 +363,8 @@ class PersonenErinnerung:
                 # Alle Lernereignisse chronologisch neu einspielen -> identische references.
                 # Aktivierung/Status in der Datei sind nur zum Lesen, ACT-Up rechnet sie neu.
                 ereignisse = sorted(
-                    (r, json.dumps({"person": c["person"], "attribut": c["attribut"],
+                    (r, json.dumps({"person": c["person"],
+                                    "attribut": UMBENENNUNG.get(c["attribut"], c["attribut"]),
                                     "wert": c["wert"]}, sort_keys=True))
                     for c in daten["chunks"] for r in c["gelernt_minuten"])
                 for t, slots in ereignisse:
