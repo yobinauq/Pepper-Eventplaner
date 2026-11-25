@@ -1,8 +1,8 @@
 """Gespräch mit dem Backend im Terminal simulieren - ohne Pepper, ohne Kamera, MIT echtem GPT.
 
 1. Terminal:  DATEN_ORDNER=test_daten python -m uvicorn main:app --host 0.0.0.0 --port 8000
-2. Terminal:  python chat_test.py                 (Test-Person "lea", Modus 1)
-              python chat_test.py max 3           (Test-Person "max", Modus 3)
+2. Terminal:  python werkzeuge/chat_test.py        (Test-Person "lea", Modus 1)
+              python werkzeuge/chat_test.py max 3  (Test-Person "max", Modus 3)
 
 Modi:  1 = Zustandsraum + Gedächtnis   2 = nur Zustandsraum
        3 = nur Gedächtnis              4 = nur Prompt

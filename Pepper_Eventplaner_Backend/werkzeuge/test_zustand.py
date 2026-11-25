@@ -1,6 +1,10 @@
 """Testet die Statusberechnung mit den Interaktionen aus der Studienplanung.
-Start im Backend-Ordner:  python test_zustand.py   (kein OpenAI, keine Kamera nötig)"""
-import zustand as z
+Start im Backend-Ordner:  python werkzeuge/test_zustand.py   (kein OpenAI, keine Kamera nötig)"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import zustand as z  # noqa: E402
 
 
 def zeige(titel, stand, alt=None):

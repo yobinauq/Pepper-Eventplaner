@@ -257,7 +257,7 @@ class ChatRequest(BaseModel):
     # Von der Versuchsleitung am Tablet eingegeben (z.B. "P07") - Schluessel fuer Verlauf,
     # Sitzungsspeicher (Modus 2) und Log
     teilnehmer_id: str | None = None
-    # Nur zum Testen ohne Kamera (chat_test.py): feste Test-Person statt Gesichtserkennung
+    # Nur zum Testen ohne Kamera (werkzeuge/chat_test.py): feste Test-Person statt Gesichtserkennung
     test_person_id: str | None = None
 
 
@@ -653,7 +653,7 @@ def chat(modus: int, request: ChatRequest):
     ergebnis = antwort(text, cid=verlauf_key, modus=modus, person_id=person_id, person_neu=person_neu,
                        themen=kurz, person_name=stand.get("name"))
     if request.test_person_id:
-        # Nur im Testmodus: zeigen, was intern passiert ist (fuer chat_test.py)
+        # Nur im Testmodus: zeigen, was intern passiert ist (fuer werkzeuge/chat_test.py)
         ergebnis["debug"] = {"extrahiert": wunsch, "gelernt": gelernt, "abgelehnt": abgelehnt,
                              "seit_letztem_mal": aenderungen, "neue_interaktion": neue_interaktion,
                              "block": block, "antwortzeit_s": antwortzeit}

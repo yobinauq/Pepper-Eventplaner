@@ -263,7 +263,7 @@ class PersonenErinnerung:
             self.speichern()
 
     def test_person(self, person_id):
-        """Nur zum Testen ohne Kamera (chat_test.py): feste person_id statt Gesichtserkennung.
+        """Nur zum Testen ohne Kamera (werkzeuge/chat_test.py): feste person_id statt Gesichtserkennung.
         Bekommt ein zufälliges Embedding, damit echte Gesichter sie nie treffen.
         -> (person_id, neu, zuletzt_gesehen_vorher) wie erkenne()"""
         with self.lock:

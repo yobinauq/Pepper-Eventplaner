@@ -1,11 +1,7 @@
-personen_register.json
-actup_gedaechtnis.json
+# Studiendaten (Gesichts-Embeddings, Namen, Gespraeche) - nie committen
+daten/
+daten_*/
+test_daten/
 *.tmp
 .venv/
 __pycache__/
-handlungsraum.json
-interaktionen_log.jsonl
-test_daten_*.json
-test_daten_*.jsonl
-daten/
-test_daten/
