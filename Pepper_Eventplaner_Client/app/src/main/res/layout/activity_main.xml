@@ -52,7 +52,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             android:padding="14dp"
-            android:text="Gedächtnis: noch niemand erkannt"
+            android:text="Planung: –"
             android:textSize="15sp"
             android:textColor="#00FF41"
             android:background="@drawable/bubble_bg"
@@ -75,6 +75,24 @@
             android:background="@drawable/btn_primary_selector"
             app:layout_constraintTop_toBottomOf="@id/txtMemory"
             app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent" />
+
+        <!-- Nur fuer die Versuchsleitung: zeigt Bedingung + Teilnehmer-ID,
+             LANGES Druecken oeffnet den Dialog zum Wechseln der Bedingung -->
+        <Button
+            android:id="@+id/btnBedingung"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginTop="12dp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="–"
+            android:textSize="12sp"
+            android:textColor="#64748B"
+            android:typeface="monospace"
+            android:textAllCaps="false"
+            android:background="@android:color/transparent"
+            app:layout_constraintTop_toBottomOf="@id/btnMicMode"
             app:layout_constraintEnd_toEndOf="parent" />
 
     </android.support.constraint.ConstraintLayout>

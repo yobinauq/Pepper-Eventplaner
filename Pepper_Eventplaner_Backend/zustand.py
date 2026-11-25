@@ -373,20 +373,52 @@ def wende_an(stand: dict, daten: dict) -> tuple[dict, list[tuple[str, str]]]:
     return lernen, abgelehnt
 
 
+def uebernehme_ohne_regeln(stand: dict, daten: dict) -> dict:
+    """Modus OHNE Zustandsraum (nur Gedächtnis): alles Gesagte wird übernommen,
+    nichts wird geprüft oder blockiert. -> {attribut: wert} für ACT-Up"""
+    s = dict(stand)
+    lernen = {}
+
+    def setze(attribut, wert):
+        if wert is not None and s.get(attribut) != wert:
+            s[attribut] = wert
+            lernen[attribut] = wert
+
+    for k in ("event_typ", "datum", "dauer", "personenzahl", "budget",
+              "gaesteliste", "location", "catering", "programm"):
+        setze(k, daten.get(k))
+    if daten.get("gaesteliste_vorlage") and s.get("personenzahl"):
+        setze("gaesteliste", min(s["personenzahl"], len(VORNAMEN) * len(NACHNAMEN)))
+    if daten.get("catering"):
+        setze("catering_personen", s.get("personenzahl"))
+    if daten.get("einladungen_verschicken"):
+        setze("einladungen_datum", s.get("datum") or "unbekannt")
+        setze("einladungen_anzahl", s.get("gaesteliste") or s.get("personenzahl") or 0)
+    return lernen
+
+
 # ============================================================
 # Vergleich mit dem letzten Handlungsraum
 # ============================================================
+
+def vergleiche_fakten(alt_stand: dict | None, stand: dict) -> list[str]:
+    """Nur geänderte Werte, z.B. 'Personenzahl: 60 → 90' (ohne Status)."""
+    if not alt_stand:
+        return []
+    zeilen = []
+    for k in EINZELWERTE:
+        vorher, jetzt = alt_stand.get(k), stand.get(k)
+        if vorher != jetzt and jetzt is not None:
+            zeilen.append(f"{LABEL[k]}: {vorher if vorher is not None else 'unbekannt'} → {jetzt}")
+    return zeilen
+
 
 def vergleiche(alt: dict | None, stand: dict, status: dict) -> list[str]:
     """'Seit dem letzten Mal hat sich ... geändert, dadurch ist ... wieder offen'.
     alt = {"stand": ..., "status": ...} vom Ende der letzten Interaktion."""
     if not alt:
         return []
-    zeilen = []
-    for k in EINZELWERTE:
-        vorher, jetzt = alt["stand"].get(k), stand.get(k)
-        if vorher != jetzt and jetzt is not None:
-            zeilen.append(f"{LABEL[k]}: {vorher if vorher is not None else 'unbekannt'} → {jetzt}")
+    zeilen = vergleiche_fakten(alt["stand"], stand)
 
     for aktion, e in status.items():
         a = alt["status"].get(aktion, {}).get("status")
@@ -444,6 +476,27 @@ def zustand_text(stand: dict, status: dict) -> list[str]:
     return z
 
 
+def fakten_text(stand: dict) -> list[str]:
+    """Modus OHNE Zustandsraum: nur die gemerkten Werte, keine Status, keine Berechnungen."""
+    z = ["GEMERKTE PLANUNGSDATEN:"]
+    for k in ("event_typ", "datum", "dauer", "personenzahl", "budget", "gaesteliste",
+              "location", "catering", "catering_personen", "programm",
+              "einladungen_datum", "einladungen_anzahl"):
+        if stand.get(k) is not None:
+            vorher = f" (vorher {stand[k + '_vorher']})" if k + "_vorher" in stand else ""
+            z.append(f"- {LABEL[k]}: {stand[k]}{vorher}")
+    if len(z) == 1:
+        z.append("- noch nichts")
+    return z
+
+
+def fakten_kurz(stand: dict) -> list[str]:
+    """Kurzfassung für die App-Zeile im Modus ohne Zustandsraum."""
+    namen = {"datum": "Datum", "personenzahl": "Personen", "budget": "Budget",
+             "location": "Location", "catering": "Catering"}
+    return [f"{n} {stand[k]}" for k, n in namen.items() if stand.get(k) is not None]
+
+
 def status_text(status: dict) -> list[str]:
     z = ["STATUS DER AKTIONEN:"]
     for aktion, e in status.items():
@@ -458,15 +511,20 @@ def status_text(status: dict) -> list[str]:
     return z
 
 
-def katalog_text(stand: dict) -> list[str]:
+def katalog_text(stand: dict, mit_hinweisen: bool = True) -> list[str]:
+    """mit_hinweisen=True (Zustandsraum): System markiert 'zu klein' / 'belegt'.
+    mit_hinweisen=False: nur die Rohdaten inkl. belegter Termine - GPT muss selbst prüfen."""
     datum, p = stand.get("datum"), stand.get("personenzahl")
     z = ["KATALOG LOCATIONS (nur diese gibt es):"]
     for name, info in LOCATIONS.items():
         hinweise = []
-        if p and info["kapazitaet"] < p:
-            hinweise.append("zu klein")
-        if datum and not location_frei(name, datum):
-            hinweise.append(f"am {datum} belegt")
+        if mit_hinweisen:
+            if p and info["kapazitaet"] < p:
+                hinweise.append("zu klein")
+            if datum and not location_frei(name, datum):
+                hinweise.append(f"am {datum} belegt")
+        elif info["belegt"]:
+            hinweise.append("belegt am " + ", ".join(info["belegt"]))
         z.append(f"- {name}, {info['standort']}: bis {info['kapazitaet']} Personen, "
                  f"{info['kosten']} Euro" + (f" [{', '.join(hinweise)}]" if hinweise else ""))
     z.append("KATALOG CATERING (Preis pro Person): "

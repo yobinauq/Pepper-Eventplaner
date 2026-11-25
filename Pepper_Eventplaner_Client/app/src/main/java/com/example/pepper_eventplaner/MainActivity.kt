@@ -12,6 +12,9 @@ import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.TextView
 import com.aldebaran.qi.Future
 import com.aldebaran.qi.sdk.QiContext
@@ -49,7 +52,18 @@ class MainActivity : RobotActivity(), RobotLifecycleCallbacks {
         private const val REQ_RECORD_AUDIO = 2001
         private const val TEXT_RECEIVER_PORT = 8080
         private const val FOCUS_TIMEOUT_MS = 120_000L
+
+        // Neutrale Bezeichnungen fuer die Teilnehmenden -> Backend-Modus.
+        // Die Zuordnung steht NUR hier (und im Versuchsplan), nicht auf dem Tablet.
+        //   1 = Zustandsraum + Gedaechtnis   2 = nur Zustandsraum
+        //   3 = nur Gedaechtnis              4 = nur Prompt
+        private val BEDINGUNGEN = linkedMapOf("A" to 1, "B" to 2, "C" to 3, "D" to 4)
     }
+
+    // ---- Studie: von der Versuchsleitung am Tablet gewaehlt ----
+    @Volatile private var bedingung = "A"
+    @Volatile private var modus = 1
+    @Volatile private var teilnehmerId = ""
 
     private var qiContext: QiContext? = null
     private var takePictureFuture: Future<TakePicture>? = null
@@ -95,6 +109,12 @@ class MainActivity : RobotActivity(), RobotLifecycleCallbacks {
         QiSDK.register(this, this)
         ensureAudioPermission()
         initSpeechRecognizer()
+
+        // Langes Druecken: Bedingung wechseln, ohne die App neu zu starten
+        findViewById<Button>(R.id.btnBedingung)?.setOnLongClickListener {
+            showStudienDialog(cancelable = true)
+            true
+        }
         showBackendAddressDialog()
     }
 
@@ -152,10 +172,79 @@ class MainActivity : RobotActivity(), RobotLifecycleCallbacks {
                     backendBaseUrl = entered
                     prefs.edit().putString("backend_base_url", entered).apply()
                 }
-                backendConfigured = true
-                if (qiContext != null) startConversation()
+                showStudienDialog(cancelable = false)
             }
             .show()
+    }
+
+    /**
+     * Versuchsleitung waehlt Teilnehmer-ID und Bedingung (A-D).
+     * Beim Start und spaeter per langem Druck auf den Bedingungs-Button - die App laeuft weiter.
+     */
+    private fun showStudienDialog(cancelable: Boolean) {
+        val prefs = getSharedPreferences("pepper_eventplaner", MODE_PRIVATE)
+        stopListening()   // waehrend der Auswahl nicht zuhoeren
+
+        val idFeld = EditText(this).apply {
+            hint = "Teilnehmer-ID, z.B. P07"
+            setText(teilnehmerId.ifBlank { prefs.getString("teilnehmer_id", "") ?: "" })
+            setSelection(text.length)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }
+        // Vorauswahl: beim Wechsel die naechste Bedingung, beim Start die zuletzt genutzte
+        val buchstaben = BEDINGUNGEN.keys.toList()
+        val vorauswahl = if (cancelable) {
+            buchstaben[(buchstaben.indexOf(bedingung) + 1) % buchstaben.size]
+        } else {
+            prefs.getString("bedingung", "A") ?: "A"
+        }
+        val gruppe = RadioGroup(this)
+        val knoepfe = buchstaben.associateWith { b ->
+            RadioButton(this).apply {
+                id = View.generateViewId()
+                text = "Bedingung $b"
+                textSize = 18f
+            }.also { gruppe.addView(it) }
+        }
+        knoepfe[vorauswahl]?.isChecked = true
+
+        val inhalt = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 0)
+            addView(idFeld)
+            addView(gruppe)
+        }
+
+        val dialog = android.support.v7.app.AlertDialog.Builder(this)
+            .setTitle("Studie: Teilnehmer und Bedingung")
+            .setView(inhalt)
+            .setCancelable(false)
+            .setPositiveButton("Starten") { _, _ ->
+                val gewaehlt = knoepfe.entries.firstOrNull { it.value.isChecked }?.key ?: vorauswahl
+                val id = idFeld.text.toString().trim().ifBlank { "ohne_id" }
+                starteBedingung(gewaehlt, id)
+                prefs.edit().putString("teilnehmer_id", id).putString("bedingung", gewaehlt).apply()
+            }
+        if (cancelable) {
+            dialog.setNegativeButton("Abbrechen") { _, _ ->
+                if (qiContext != null) startConversation()
+            }
+        }
+        dialog.show()
+    }
+
+    private fun starteBedingung(neueBedingung: String, id: String) {
+        bedingung = neueBedingung
+        modus = BEDINGUNGEN[neueBedingung] ?: 1
+        teilnehmerId = id
+        Log.i(TAG, "Bedingung $bedingung (Modus $modus), Teilnehmer $teilnehmerId")
+        runOnUiThread {
+            findViewById<Button>(R.id.btnBedingung)?.text = "$bedingung · $teilnehmerId"
+            findViewById<TextView>(R.id.txtUser)?.text = ""
+            findViewById<TextView>(R.id.txtMemory)?.text = "Planung: –"
+        }
+        backendConfigured = true
+        if (qiContext != null) startConversation()
     }
 
     private fun startConversation() {
@@ -174,6 +263,16 @@ class MainActivity : RobotActivity(), RobotLifecycleCallbacks {
     }
 
     private fun showMemory(json: JSONObject) {
+        val themenArr = json.optJSONArray("erinnerte_themen")
+        val themen = (0 until (themenArr?.length() ?: 0)).map { themenArr!!.getString(it) }
+        val planung = "Planung: " + if (themen.isEmpty()) "–" else themen.joinToString(", ")
+
+        // Ohne Gedaechtnis (Modus 2, 4): keine Person anzeigen - das Tablet soll nicht verraten,
+        // dass Pepper in dieser Bedingung niemanden erkennt.
+        if (!json.optBoolean("gedaechtnis", true)) {
+            setText(R.id.txtMemory, planung)
+            return
+        }
         val personId = json.optString("person_id", "").takeIf { it.isNotBlank() && it != "null" }
         if (personId == null) {
             setText(R.id.txtMemory, "Gedächtnis: kein Gesicht erkannt")
@@ -181,12 +280,8 @@ class MainActivity : RobotActivity(), RobotLifecycleCallbacks {
         }
         val name = json.optString("person_name", "").takeIf { it.isNotBlank() && it != "null" }
         val neu = json.optBoolean("person_neu", false)
-        val themenArr = json.optJSONArray("erinnerte_themen")
-        val themen = (0 until (themenArr?.length() ?: 0)).map { themenArr!!.getString(it) }
-
         val wer = (name ?: "Unbekannt") + " ($personId)" + if (neu) " – neu" else " – wiedererkannt"
-        val was = if (themen.isEmpty()) "keine aktiven Erinnerungen" else themen.joinToString(", ")
-        setText(R.id.txtMemory, "Person: $wer\nErinnerungen: $was")
+        setText(R.id.txtMemory, "Person: $wer\n$planung")
     }
 
     // ================= Sprechen =================
@@ -416,7 +511,8 @@ class MainActivity : RobotActivity(), RobotLifecycleCallbacks {
     }
 
     private fun postChat(userText: String, faceBytes: ByteArray?): JSONObject {
-        val conn = (URL("$backendBaseUrl/chat").openConnection() as HttpURLConnection).apply {
+        // Eigener Endpunkt pro Modus: /chat/1 ... /chat/4
+        val conn = (URL("$backendBaseUrl/chat/$modus").openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             setRequestProperty("Content-Type", "application/json")
             doOutput = true
@@ -425,6 +521,7 @@ class MainActivity : RobotActivity(), RobotLifecycleCallbacks {
         }
         val body = JSONObject().apply {
             put("conversation_id", conversationId)
+            put("teilnehmer_id", teilnehmerId)
             put("text", userText)
             if (faceBytes != null && faceBytes.isNotEmpty()) {
                 put("face_image_base64", Base64.encodeToString(faceBytes, Base64.NO_WRAP))

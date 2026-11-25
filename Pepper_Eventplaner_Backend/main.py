@@ -1,18 +1,27 @@
-"""Pepper-Eventplaner: Chat-Backend mit ACT-Up-Gedaechtnis und Zustandsraum.
+"""Pepper-Eventplaner: Chat-Backend fuer die Studie mit 4 Modi (2x2-Design).
 
-Ablauf pro Anfrage:
-  1. Gesichtsbild (lokal) -> person_id -> Zustand aus ACT-Up
-  2. GPT extrahiert, was sich laut Aussage aendern soll
-  3. zustand.wende_an() prueft das gegen die Regeln (blockierte Aktionen werden abgelehnt)
-     -> erlaubte Aenderungen werden in ACT-Up gelernt
-  4. Status aller Aktionen neu berechnen + mit dem letzten Handlungsraum vergleichen
-  5. GPT antwortet mit ZUSTAND / STATUS / SEIT DEM LETZTEN MAL / ABGELEHNT / KATALOG
-  6. Handlungsraum speichern + Interaktion ins Log schreiben
+             | mit Gedaechtnis (ACT-Up) | ohne Gedaechtnis
+  -----------+--------------------------+-----------------
+  mit Zust.  | Modus 1   /chat/1        | Modus 2  /chat/2
+  ohne Zust. | Modus 3   /chat/3        | Modus 4  /chat/4
 
-Start (alle Dateien optional, das sind die Standardnamen):
-  ACTUP_DATEI=actup_gedaechtnis.json PERSONEN_DATEI=personen_register.json \\
-  HANDLUNGSRAUM_DATEI=handlungsraum.json LOG_DATEI=interaktionen_log.jsonl \\
-      python -m uvicorn main:app --host 0.0.0.0 --port 8000
+  Zustandsraum = Regeln: Status je Aktion, Blockieren, "wieder offen", naechster Schritt
+  Gedaechtnis  = Person: Gesichtserkennung, ACT-Up (mit Vergessen), Name, Wuensche,
+                 Wiederbegruessung "Seit dem letzten Mal ..."
+  In ALLEN Modi gleich: Modell, Sprechregeln, Katalog, Chatverlauf (Arbeitsspeicher).
+
+Ablauf pro Anfrage (je nach Modus werden Schritte uebersprungen):
+  1. Person erkennen (nur mit Gedaechtnis) bzw. Teilnehmer-ID als Schluessel
+  2. GPT extrahiert, was sich laut Aussage aendern soll        (nicht in Modus 4)
+  3. mit Zustandsraum: Regelpruefung (zustand.wende_an), sonst alles uebernehmen
+  4. Status / Aenderungen berechnen
+  5. GPT antwortet mit Grundprompt + Modus-Bausteinen + Block
+  6. Handlungsraum speichern + Log (mit modus, teilnehmer_id, antwortzeit)
+
+Start:
+  python -m uvicorn main:app --host 0.0.0.0 --port 8000
+  Daten liegen in DATEN_ORDNER (Standard "daten"), getrennt pro Modus.
+  Zum Testen: DATEN_ORDNER=test_daten python -m uvicorn main:app --host 0.0.0.0 --port 8000
 """
 import json
 import os
@@ -28,59 +37,110 @@ from pydantic import BaseModel
 
 import zustand as z
 from personen_gedaechtnis import PersonenErinnerung
+from sitzungs_speicher import SitzungsSpeicher
 
 MODELL = "gpt-4.1-mini"
 MAX_ANTWORT_ZEICHEN = 350
 
-# Kurzzeit-Verlauf: aeltere Nachrichten gehen nicht mehr an GPT, Laengeres
-# kommt nur noch aus ACT-Up - Pepper "erinnert" nichts, was ACT-Up vergessen hat.
-VERLAUF_NACH_MINUTEN = 5
-VERLAUF_MAX_EINTRAEGE = 10
+# Die 4 Studien-Modi
+MODI = {
+    1: {"zustandsraum": True,  "gedaechtnis": True},
+    2: {"zustandsraum": True,  "gedaechtnis": False},
+    3: {"zustandsraum": False, "gedaechtnis": True},
+    4: {"zustandsraum": False, "gedaechtnis": False},
+}
+
+# Chatverlauf = Arbeitsspeicher: bleibt im RAM (pro Modus + Teilnehmer), kein Zeitlimit.
+# Geloescht wird er erst durch POST /sitzung/reset oder einen Neustart des Backends.
+VERLAUF_MAX_EINTRAEGE = 50
 
 # Kommt eine Person nach so langer Pause wieder, gilt das als neue Interaktion
-# -> Pepper fasst Aenderungen mit "Seit dem letzten Mal ..." zusammen
-NEUE_INTERAKTION_NACH_MINUTEN = VERLAUF_NACH_MINUTEN
+# -> (nur mit Gedaechtnis) Wiederbegruessung "Seit dem letzten Mal ..."
+NEUE_INTERAKTION_NACH_MINUTEN = 5
 
 FEHLER_ANTWORT = (
     "Entschuldigung, ich kann gerade nicht richtig nachdenken. "
     "Versuch es bitte gleich noch einmal."
 )
 
-SYSTEM_PEPPER = """
+# Grundprompt: in ALLEN Modi gleich
+PROMPT_GRUND = """
 Du bist Pepper, ein humanoider Roboter und Assistent für Eventplanung (Partys, Hochzeiten, Feiern).
 Du hilfst der Person, ihr Event Schritt für Schritt zu planen.
 
-Gedächtnis und Zustand:
-- Im Abschnitt GEDÄCHTNIS stehen ZUSTAND und STATUS DER AKTIONEN. Nur diese Fakten sind sicher,
-  erfinde KEINE weiteren. Der Status wird vom System berechnet - übernimm ihn, rechne ihn nicht selbst neu.
-- Locations und Catering gibt es NUR aus dem KATALOG. Schlage nur passende Einträge vor
-  (keine, die "zu klein" oder "belegt" markiert sind).
-
-Reagieren:
-- Steht etwas unter GERADE GEÄNDERT, hat die Person das eben selbst gesagt. Bestätige es direkt
-  in der Gegenwart und nenne die wichtigste Folge, z.B.: "Alles klar, dann planen wir jetzt mit
-  hundertfünfundzwanzig Gästen. Dafür ist Halle B allerdings zu klein."
-  NICHT so, als wäre es schon früher passiert ("ist bereits geändert", "wurde schon").
-- Steht etwas unter SEIT DEM LETZTEN MAL (neue Interaktion), kommt die Person nach einer Pause
-  wieder. Begrüße sie kurz und fasse zusammen, z.B.: "Seit dem letzten Mal hat sich die
-  Personenzahl von sechzig auf neunzig geändert, dadurch sind Location und Catering wieder offen."
-- Nenne bei Änderungen höchstens die zwei wichtigsten Folgen.
-- Gästeliste: Die Gäste kommen aus den Kontakten der Person (Beispieldaten). Ist die Gästeliste
-  der nächste Schritt, biete an, Kontakte einzutragen. Wurde sie gerade gefüllt, sag z.B.:
-  "Okay, ich trage jetzt als Beispiel dreihundert Personen aus deinen Kontakten ein, zum Beispiel
-  Anna Becker und Jonas Weber." Nenne höchstens zwei Namen, lies nie die ganze Liste vor.
-- Steht etwas unter ABGELEHNT, behaupte NIE, es sei erledigt. Erkläre kurz den Grund
-  und biete an, zuerst die fehlende Voraussetzung zu klären.
-- Eine blockierte Aktion darfst du nicht ausführen; nenne, was vorher fehlt.
-- Schlage am Ende genau EINEN nächsten Schritt vor: den unter NÄCHSTER SCHRITT.
+Planung:
+- Locations und Catering gibt es NUR aus dem KATALOG. Erfinde keine anderen.
+- Die Gäste kommen aus den Kontakten der Person (Beispieldaten). Nenne Gästenamen nur, wenn sie
+  unten als Beispiele stehen - höchstens zwei, lies nie eine ganze Liste vor.
 - Frage immer nur EINE Sache pro Antwort.
-- Lies keine Listen vor (keine Gästenamen, nicht den ganzen Katalog) - nenne höchstens zwei Optionen.
+- Lies keine Listen vor (nicht den ganzen Katalog) - nenne höchstens zwei Optionen.
 
 Sprechen:
 - Höchstens 2-3 kurze Sätze, keine Listen, keine Emojis, kein Markdown.
 - Zahlen ausschreiben, wie man sie spricht ("sechstausend Euro").
 - Du bist kein ChatGPT und erwähnst keine Modellnamen.
 """.strip()
+
+# Baustein Zustandsraum (Modus 1 + 2)
+PROMPT_ZUSTANDSRAUM = """
+Planungsstand (vom System berechnet):
+- Unter ZUSTAND und STATUS DER AKTIONEN steht der aktuelle Planungsstand. Nur diese Fakten sind
+  sicher. Der Status wird vom System berechnet - übernimm ihn, rechne ihn nicht selbst neu.
+- Schlage im KATALOG nur Einträge vor, die nicht "zu klein" oder "belegt" markiert sind.
+- Steht etwas unter GERADE GEÄNDERT, hat die Person das eben selbst gesagt. Bestätige es direkt
+  in der Gegenwart und nenne die wichtigste Folge, z.B.: "Alles klar, dann planen wir jetzt mit
+  hundertfünfundzwanzig Gästen. Dafür ist Halle B allerdings zu klein."
+  NICHT so, als wäre es schon früher passiert ("ist bereits geändert", "wurde schon").
+- Nenne bei Änderungen höchstens die zwei wichtigsten Folgen.
+- Steht etwas unter ABGELEHNT, behaupte NIE, es sei erledigt. Erkläre kurz den Grund
+  und biete an, zuerst die fehlende Voraussetzung zu klären.
+- Eine blockierte Aktion darfst du nicht ausführen; nenne, was vorher fehlt.
+- Schlage am Ende genau EINEN nächsten Schritt vor: den unter NÄCHSTER SCHRITT.
+- Ist die Gästeliste der nächste Schritt, biete an, Kontakte einzutragen. Wurde sie gerade gefüllt,
+  sag z.B.: "Okay, ich trage jetzt als Beispiel dreihundert Personen aus deinen Kontakten ein,
+  zum Beispiel Anna Becker und Jonas Weber."
+""".strip()
+
+# Baustein Gedaechtnis (Modus 1 + 3)
+PROMPT_GEDAECHTNIS = """
+Gedächtnis (du erkennst die Person wieder):
+- Unter GEDÄCHTNIS steht, was du über diese Person weißt (Name, Wünsche, Themen). Nutze es
+  persönlich, aber erfinde nichts dazu. Sprich die Person gelegentlich mit Namen an.
+- Steht dort "Neue Interaktion", kommt die Person nach einer Pause wieder: Begrüße sie kurz
+  persönlich ("Schön, dass du wieder da bist, Lea!").
+- Steht etwas unter SEIT DEM LETZTEN MAL, fasse es nach der Begrüßung kurz zusammen, z.B.:
+  "Seit dem letzten Mal hat sich die Personenzahl von sechzig auf neunzig geändert."
+""".strip()
+
+# Baustein: Gedaechtnis OHNE Zustandsraum (Modus 3)
+PROMPT_NUR_FAKTEN = """
+Planung ohne Systemprüfung:
+- Unter GEMERKTE PLANUNGSDATEN steht, was du dir zur Planung gemerkt hast. Es gibt keine
+  automatische Prüfung - überlege selbst, was als Nächstes sinnvoll ist.
+- Steht etwas unter GERADE GEÄNDERT, hat die Person das eben gesagt: bestätige es direkt.
+""".strip()
+
+# Baustein: weder Zustandsraum noch Gedaechtnis (Modus 4)
+PROMPT_NUR_VERLAUF = """
+Planung nur aus dem Gespräch:
+- Du hast kein zusätzliches Gedächtnis. Orientiere dich am bisherigen Gesprächsverlauf und
+  überlege selbst, was als Nächstes sinnvoll ist.
+""".strip()
+
+
+def system_prompt(modus: int) -> str:
+    cfg = MODI[modus]
+    teile = [PROMPT_GRUND]
+    if cfg["zustandsraum"]:
+        teile.append(PROMPT_ZUSTANDSRAUM)
+    if cfg["gedaechtnis"]:
+        teile.append(PROMPT_GEDAECHTNIS)
+    if cfg["gedaechtnis"] and not cfg["zustandsraum"]:
+        teile.append(PROMPT_NUR_FAKTEN)
+    if not cfg["gedaechtnis"] and not cfg["zustandsraum"]:
+        teile.append(PROMPT_NUR_VERLAUF)
+    return "\n\n".join(teile)
+
 
 SYSTEM_EXTRAKTION = """
 Du extrahierst Planungsdaten aus einer Aussage an den Eventplanungs-Roboter Pepper.
@@ -165,17 +225,27 @@ if not api_key:
 
 # timeout 15 s, keine Retries: Pepper sagt lieber sofort Bescheid als lange zu warten
 client = OpenAI(api_key=api_key, timeout=15.0, max_retries=0)
-# ACT-Up-Chunks (Erinnerungen) und Gesichtsregister werden beim Start geladen
-# und nach jeder Aenderung gespeichert.
-personen = PersonenErinnerung(
-    actup_datei=os.getenv("ACTUP_DATEI", "actup_gedaechtnis.json"),
-    personen_datei=os.getenv("PERSONEN_DATEI", "personen_register.json"),
-)
-HANDLUNGSRAUM_DATEI = os.getenv("HANDLUNGSRAUM_DATEI", "handlungsraum.json")
-LOG_DATEI = os.getenv("LOG_DATEI", "interaktionen_log.jsonl")
+# Alle Daten getrennt pro Modus - wer Modus 1 und danach Modus 3 macht, wird in Modus 3
+# NICHT schon wiedererkannt.
+DATEN_ORDNER = os.getenv("DATEN_ORDNER", "daten")
+os.makedirs(DATEN_ORDNER, exist_ok=True)
+
+
+def _datei(name: str) -> str:
+    return os.path.join(DATEN_ORDNER, name)
+
+
+# Speicher: ACT-Up (Modus 1, 3), einfacher Sitzungsspeicher (Modus 2), keiner (Modus 4)
+speicher = {
+    1: PersonenErinnerung(_datei("modus1_actup_gedaechtnis.json"), _datei("modus1_personen_register.json")),
+    2: SitzungsSpeicher(_datei("modus2_planung.json")),
+    3: PersonenErinnerung(_datei("modus3_actup_gedaechtnis.json"), _datei("modus3_personen_register.json")),
+    4: None,
+}
+LOG_DATEI = _datei("interaktionen_log.jsonl")
 app = FastAPI()
 
-# person_id/conversation_id -> [{"role", "content", "ts"}]
+# Chatverlauf (Arbeitsspeicher): "m<modus>:<teilnehmer>" -> [{"role", "content", "ts"}]
 history: dict[str, list[dict]] = {}
 
 
@@ -184,16 +254,21 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     # Nur fuer die lokale Gesichtserkennung - geht NICHT an OpenAI
     face_image_base64: str | None = None
+    # Von der Versuchsleitung am Tablet eingegeben (z.B. "P07") - Schluessel fuer Verlauf,
+    # Sitzungsspeicher (Modus 2) und Log
+    teilnehmer_id: str | None = None
     # Nur zum Testen ohne Kamera (chat_test.py): feste Test-Person statt Gesichtserkennung
     test_person_id: str | None = None
 
 
-def antwort(text, *, cid=None, mode="chat", person_id=None, person_neu=None,
+def antwort(text, *, cid=None, mode="chat", modus=None, person_id=None, person_neu=None,
             themen=None, person_name=None) -> dict:
     return {
         "text": text,
         "conversation_id": cid,
         "mode": mode,
+        "modus": modus,
+        "gedaechtnis": MODI[modus]["gedaechtnis"] if modus else None,
         "person_id": person_id,
         "person_neu": person_neu,
         "person_name": person_name,
@@ -249,18 +324,7 @@ def verlauf_merken(cid: str, role: str, text: str):
     history[cid] = eintraege[-VERLAUF_MAX_EINTRAEGE:]
 
 
-def verlaeufe_aufraeumen():
-    """Loescht bei ALLEN Personen Nachrichten, die aelter als VERLAUF_NACH_MINUTEN sind
-    (auch bei Personen, die nicht wiederkommen)."""
-    grenze = time.time() - VERLAUF_NACH_MINUTEN * 60
-    for cid in list(history):  # list(): Eintraege werden waehrend der Schleife geloescht
-        history[cid] = [e for e in history[cid] if e["ts"] >= grenze]
-        if not history[cid]:
-            del history[cid]
-
-
 def verlauf_holen(cid: str) -> list[dict]:
-    verlaeufe_aufraeumen()
     return [{"role": e["role"], "content": e["content"]} for e in history.get(cid, [])]
 
 
@@ -289,27 +353,32 @@ def _zeitspanne(sekunden: float) -> str:
 
 # ---------- Handlungsraum (letzter Stand pro Person) + Log ----------
 
-def _lade_handlungsraum() -> dict:
-    if os.path.exists(HANDLUNGSRAUM_DATEI):
-        with open(HANDLUNGSRAUM_DATEI, encoding="utf-8") as f:
+def _handlungsraum_datei(modus: int) -> str:
+    return _datei(f"modus{modus}_handlungsraum.json")
+
+
+def _lade_handlungsraum(modus: int) -> dict:
+    if os.path.exists(_handlungsraum_datei(modus)):
+        with open(_handlungsraum_datei(modus), encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-handlungsraum: dict[str, dict] = _lade_handlungsraum()
+# Letzter Handlungsraum pro Modus und Schluessel (person_id bzw. Sitzung)
+handlungsraum: dict[int, dict[str, dict]] = {m: _lade_handlungsraum(m) for m in MODI}
 
 
-def speichere_handlungsraum(person_id: str, stand: dict, status: dict):
-    """Letzten Handlungsraum merken - Grundlage fuer 'Seit dem letzten Mal ...'."""
-    handlungsraum[person_id] = {
+def speichere_handlungsraum(modus: int, schluessel: str, stand: dict, status: dict | None):
+    """Letzten Handlungsraum merken - Grundlage fuer 'Gerade geaendert' / 'Seit dem letzten Mal'."""
+    handlungsraum[modus][schluessel] = {
         "zeit": time.strftime("%Y-%m-%d %H:%M:%S"),
         "stand": {k: stand.get(k) for k in z.EINZELWERTE if stand.get(k) is not None},
         "status": status,
     }
-    tmp = HANDLUNGSRAUM_DATEI + ".tmp"
+    tmp = _handlungsraum_datei(modus) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(handlungsraum, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, HANDLUNGSRAUM_DATEI)
+        json.dump(handlungsraum[modus], f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _handlungsraum_datei(modus))
 
 
 def logge(eintrag: dict):
@@ -320,27 +389,37 @@ def logge(eintrag: dict):
 
 # ---------- Gedaechtnis -> Prompt ----------
 
-def gedaechtnis_block(stand: dict, status: dict, aenderungen: list[str], neue_interaktion: bool,
-                      abgelehnt: list[tuple[str, str]], zuletzt_gesehen: float | None,
-                      beispiel_gaeste: list[str] | None = None) -> str:
-    """Baut den GEDAECHTNIS-Block, der bei jeder Anfrage an GPT geht."""
-    zeilen = ["GEDÄCHTNIS (vom System berechnet, nur diese Fakten sind sicher):"]
-    if stand.get("name"):
-        zeilen.append(f"Name: {stand['name']} (selbst genannt, gelegentlich damit ansprechen)")
-    if neue_interaktion and zuletzt_gesehen:
-        zeilen.append(f"Neue Interaktion: ihr habt zuletzt vor "
-                      f"{_zeitspanne(time.time() - zuletzt_gesehen)} gesprochen.")
-    if not any(stand.get(k) is not None for k in z.EINZELWERTE):
-        zeilen.append("Noch nichts bekannt - das ist ein neues Gespräch.")
+def kontext_block(modus: int, stand: dict, status: dict | None, aenderungen: list[str],
+                  neue_interaktion: bool, abgelehnt: list[tuple[str, str]],
+                  zuletzt_gesehen: float | None, beispiel_gaeste: list[str] | None = None) -> str:
+    """Baut den Block, der bei jeder Anfrage an GPT geht - je nach Modus mit anderen Teilen."""
+    cfg = MODI[modus]
+    zeilen = []
 
-    zeilen += z.zustand_text(stand, status)
+    if cfg["gedaechtnis"]:
+        zeilen.append("GEDÄCHTNIS (nur diese Fakten sind sicher):")
+        if stand.get("name"):
+            zeilen.append(f"Name: {stand['name']} (selbst genannt)")
+        if neue_interaktion and zuletzt_gesehen:
+            zeilen.append(f"Neue Interaktion: ihr habt zuletzt vor "
+                          f"{_zeitspanne(time.time() - zuletzt_gesehen)} gesprochen.")
+        if stand.get("wuensche"):
+            zeilen.append("Wünsche: " + ", ".join(stand["wuensche"]))
+        if stand.get("themen"):
+            zeilen.append("Sonstige Gesprächsthemen: " + ", ".join(stand["themen"]))
+        if not any(stand.get(k) is not None for k in z.EINZELWERTE):
+            zeilen.append("Noch nichts geplant - das ist ein neues Gespräch.")
+        zeilen.append("")
+
+    if cfg["zustandsraum"]:
+        zeilen.append("PLANUNGSSTAND (vom System berechnet):")
+        zeilen += z.zustand_text(stand, status)
+    elif cfg["gedaechtnis"]:
+        zeilen += z.fakten_text(stand)
     if beispiel_gaeste:
         zeilen.append("- Beispiele von der Gästeliste: " + ", ".join(beispiel_gaeste))
-    if stand.get("wuensche"):
-        zeilen.append("- Wünsche: " + ", ".join(stand["wuensche"]))
-    if stand.get("themen"):
-        zeilen.append("- Sonstige Gesprächsthemen: " + ", ".join(stand["themen"]))
-    zeilen += [""] + z.status_text(status)
+    if cfg["zustandsraum"]:
+        zeilen += [""] + z.status_text(status)
 
     if aenderungen:
         titel = ("SEIT DEM LETZTEN MAL (neue Interaktion):" if neue_interaktion
@@ -350,11 +429,12 @@ def gedaechtnis_block(stand: dict, status: dict, aenderungen: list[str], neue_in
         zeilen += ["", "ABGELEHNT IN DIESER NACHRICHT (nicht ausgeführt!):"]
         zeilen += [f"- {z.AKTIONEN[a]['titel']}: {grund}" for a, grund in abgelehnt]
 
-    schritt = z.naechster_schritt(status)
-    zeilen += ["", "NÄCHSTER SCHRITT: " + (z.AKTIONEN[schritt]["titel"] if schritt
-                                         else "alles erledigt - Planung abgeschlossen")]
-    zeilen += [""] + z.katalog_text(stand)
-    return "\n".join(zeilen)
+    if cfg["zustandsraum"]:
+        schritt = z.naechster_schritt(status)
+        zeilen += ["", "NÄCHSTER SCHRITT: " + (z.AKTIONEN[schritt]["titel"] if schritt
+                                             else "alles erledigt - Planung abgeschlossen")]
+    zeilen += [""] + z.katalog_text(stand, mit_hinweisen=cfg["zustandsraum"])
+    return "\n".join(zeilen).strip()
 
 
 def status_kurz(stand: dict, status: dict) -> list[str]:
@@ -435,27 +515,35 @@ def analysiere_aussage(aussage: str, stand: dict, pepper_zuletzt: str | None = N
     return bereinigt, roh
 
 
-def verarbeite_aussage(person_id: str, aussage: str, stand: dict, pepper_zuletzt: str | None):
-    """Extraktion -> Regelpruefung -> ACT-Up. -> (wunsch, roh, gelernt, abgelehnt)"""
+def verarbeite_aussage(modus: int, sp, schluessel: str, aussage: str, stand: dict,
+                       pepper_zuletzt: str | None):
+    """Extraktion -> (mit Zustandsraum: Regelpruefung) -> Speicher.
+    -> (wunsch, roh, gelernt, abgelehnt)"""
+    cfg = MODI[modus]
     wunsch, roh = analysiere_aussage(aussage, stand, pepper_zuletzt)
-    name = wunsch.get("name")
-    with personen.lock:
-        aktuell = personen.stand(person_id)       # frisch lesen, falls parallel etwas kam
-        gelernt, abgelehnt = z.wende_an(aktuell, wunsch)
-        for k in ("wuensche_neu", "wuensche_entfernt", "thema"):
-            if k in wunsch:
-                gelernt[k] = wunsch[k]
-        if name:
-            personen.setze_name(person_id, name)
+    name = wunsch.get("name") if cfg["gedaechtnis"] else None
+    with sp.lock:
+        aktuell = sp.stand(schluessel)       # frisch lesen, falls parallel etwas kam
+        if cfg["zustandsraum"]:
+            gelernt, abgelehnt = z.wende_an(aktuell, wunsch)
+        else:
+            gelernt, abgelehnt = z.uebernehme_ohne_regeln(aktuell, wunsch), []
+        if cfg["gedaechtnis"]:               # Persoenliches nur mit Gedaechtnis
+            for k in ("wuensche_neu", "wuensche_entfernt", "thema"):
+                if k in wunsch:
+                    gelernt[k] = wunsch[k]
+            if name:
+                sp.setze_name(schluessel, name)
         if gelernt:
-            personen.merke_aenderungen(person_id, gelernt)
-    print(f"[Person] {person_id} -> neu gemerkt: {({'name': name} if name else {}) | gelernt or '(nichts Neues)'}"
+            sp.merke_aenderungen(schluessel, gelernt)
+    print(f"[Modus {modus}] {schluessel} -> neu gemerkt: "
+          f"{({'name': name} if name else {}) | gelernt or '(nichts Neues)'}"
           + (f" | abgelehnt: {abgelehnt}" if abgelehnt else ""))
     return wunsch, roh, gelernt, abgelehnt
 
 
 def letzte_pepper_antwort(cid: str) -> str | None:
-    """Letzte Antwort von Pepper aus dem Kurzzeit-Verlauf (None nach einer Pause)."""
+    """Letzte Antwort von Pepper aus dem Chatverlauf (fuer "ja bitte")."""
     for e in reversed(verlauf_holen(cid)):
         if e["role"] == "assistant":
             return e["content"]
@@ -465,95 +553,144 @@ def letzte_pepper_antwort(cid: str) -> str | None:
 # ---------- Endpunkte ----------
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+def chat_standard(request: ChatRequest):
+    """Ohne Modusnummer = Modus 1 (damit aeltere App-Versionen weiter funktionieren)."""
+    return chat(1, request)
+
+
+@app.post("/chat/{modus}")
+def chat(modus: int, request: ChatRequest):
+    if modus not in MODI:
+        raise HTTPException(status_code=404, detail="Modus muss 1, 2, 3 oder 4 sein.")
     prompt = (request.text or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Es fehlt 'text'.")
+    t_start = time.time()
+    cfg = MODI[modus]
+    teilnehmer = (request.teilnehmer_id or request.test_person_id
+                  or request.conversation_id or "unbekannt").strip()
+    sp = speicher[modus]
 
-    # 1. Person erkennen (lokal)
-    person_id, person_neu, zuletzt_gesehen = None, None, None
-    if request.test_person_id:
-        person_id, person_neu, zuletzt_gesehen = personen.test_person(f"test_{request.test_person_id}")
-    elif request.face_image_base64:
-        try:
-            person_id, person_neu, zuletzt_gesehen = personen.erkenne(request.face_image_base64)
-        except Exception as e:
-            print(f"[Person] Gesichtserkennung fehlgeschlagen: {e}")
+    # 1. Wer ist da? Mit Gedaechtnis: Gesicht -> person_id. Sonst: Teilnehmer-ID als Sitzung.
+    person_id, person_neu, zuletzt_gesehen, schluessel = None, None, None, None
+    if cfg["gedaechtnis"]:
+        if request.test_person_id:
+            person_id, person_neu, zuletzt_gesehen = sp.test_person(f"test_{request.test_person_id}")
+        elif request.face_image_base64:
+            try:
+                person_id, person_neu, zuletzt_gesehen = sp.erkenne(request.face_image_base64)
+            except Exception as e:
+                print(f"[Person] Gesichtserkennung fehlgeschlagen: {e}")
+        schluessel = person_id
+    elif sp is not None:
+        schluessel = f"sitzung_{teilnehmer}"
+    if schluessel is None:
+        sp = None          # Modus 4, oder kein Gesicht erkannt -> kein Speicher in dieser Nachricht
 
-    # 2.+3. Aussage auswerten, pruefen und merken (nur mit erkannter Person)
-    cid = person_id or request.conversation_id or "default"
-    pepper_zuletzt = letzte_pepper_antwort(cid)
+    # 2.+3. Aussage auswerten und merken
+    verlauf_key = f"m{modus}:{teilnehmer}"
+    pepper_zuletzt = letzte_pepper_antwort(verlauf_key)
     wunsch, roh, gelernt, abgelehnt = {}, {}, {}, []
-    stand_vorher = personen.stand(person_id) if person_id else {}
-    if person_id:
+    stand_vorher = sp.stand(schluessel) if sp else {}
+    if sp:
         try:
-            wunsch, roh, gelernt, abgelehnt = verarbeite_aussage(person_id, prompt, stand_vorher,
-                                                                 pepper_zuletzt)
+            wunsch, roh, gelernt, abgelehnt = verarbeite_aussage(
+                modus, sp, schluessel, prompt, stand_vorher, pepper_zuletzt)
         except openai.APIError:
             raise
         except Exception as e:
-            print(f"[Person] Aussage konnte nicht verarbeitet werden: {e}")
+            print(f"[Modus {modus}] Aussage konnte nicht verarbeitet werden: {e}")
 
-    # 4. Neuer Zustand + Status + Vergleich mit dem letzten Handlungsraum
-    stand = personen.stand(person_id) if person_id else {}
-    status = z.berechne_status(stand)
-    letzter = handlungsraum.get(person_id)
-    aenderungen = z.vergleiche(letzter, stand, status)
-    # Neue Interaktion = Person kommt nach einer Pause wieder (Kurzzeit-Verlauf ist abgelaufen)
-    neue_interaktion = bool(letzter) and (
+    # 4. Neuer Stand, Status, Aenderungen
+    stand = sp.stand(schluessel) if sp else {}
+    status = z.berechne_status(stand) if cfg["zustandsraum"] else None
+    letzter = handlungsraum[modus].get(schluessel) if sp else None
+    if cfg["zustandsraum"]:
+        aenderungen = z.vergleiche(letzter, stand, status)
+    else:
+        aenderungen = z.vergleiche_fakten(letzter["stand"] if letzter else None, stand)
+    # Wiederbegruessung nur mit Gedaechtnis: Person kommt nach einer Pause wieder
+    neue_interaktion = cfg["gedaechtnis"] and bool(letzter) and (
         zuletzt_gesehen is None or time.time() - zuletzt_gesehen >= NEUE_INTERAKTION_NACH_MINUTEN * 60)
 
     # 5. Antwort
-    verlauf_merken(cid, "user", prompt)
-    beispiele = z.gaesteliste_erzeugen(person_id, stand["gaesteliste"])[:3] if stand.get("gaesteliste") else None
-    block = gedaechtnis_block(stand, status, aenderungen, neue_interaktion, abgelehnt, zuletzt_gesehen,
-                              beispiele)
+    verlauf_merken(verlauf_key, "user", prompt)
+    beispiele = (z.gaesteliste_erzeugen(schluessel, stand["gaesteliste"])[:3]
+                 if sp and stand.get("gaesteliste") else None)
+    block = kontext_block(modus, stand, status, aenderungen, neue_interaktion, abgelehnt,
+                          zuletzt_gesehen, beispiele)
     resp = client.responses.create(
         model=MODELL,
-        input=[{"role": "system", "content": SYSTEM_PEPPER},
+        input=[{"role": "system", "content": system_prompt(modus)},
                {"role": "system", "content": block},
-               *verlauf_holen(cid)],
+               *verlauf_holen(verlauf_key)],
         max_output_tokens=200,
     )
     text = fuer_sprache_kuerzen(resp.output_text)
-    verlauf_merken(cid, "assistant", text)
+    verlauf_merken(verlauf_key, "assistant", text)
+    antwortzeit = round(time.time() - t_start, 2)
 
     # 6. Handlungsraum + Log
-    if person_id:
-        speichere_handlungsraum(person_id, stand, status)
-        logge({
-            "zeit": time.strftime("%Y-%m-%d %H:%M:%S"), "person_id": person_id,
-            "name": stand.get("name"), "aussage": prompt, "pepper_zuletzt": pepper_zuletzt,
-            "extrahiert_roh": roh, "extrahiert": wunsch,
-            "gelernt": gelernt, "abgelehnt": abgelehnt,
-            "stand_vorher": {k: stand_vorher.get(k) for k in z.EINZELWERTE if stand_vorher.get(k) is not None},
-            "stand_nachher": {k: stand.get(k) for k in z.EINZELWERTE if stand.get(k) is not None},
-            "status": {a: e["status"] for a, e in status.items()},
-            "aenderungen": aenderungen, "neue_interaktion": neue_interaktion, "naechster_schritt": z.naechster_schritt(status),
-            "antwort": text,
-        })
+    if sp:
+        speichere_handlungsraum(modus, schluessel, stand, status)
+    logge({
+        "zeit": time.strftime("%Y-%m-%d %H:%M:%S"), "modus": modus, "teilnehmer_id": teilnehmer,
+        "person_id": person_id, "name": stand.get("name"), "aussage": prompt,
+        "pepper_zuletzt": pepper_zuletzt, "extrahiert_roh": roh, "extrahiert": wunsch,
+        "gelernt": gelernt, "abgelehnt": abgelehnt,
+        "stand_vorher": {k: stand_vorher.get(k) for k in z.EINZELWERTE if stand_vorher.get(k) is not None},
+        "stand_nachher": {k: stand.get(k) for k in z.EINZELWERTE if stand.get(k) is not None},
+        "status": {a: e["status"] for a, e in status.items()} if status else None,
+        "aenderungen": aenderungen, "neue_interaktion": neue_interaktion,
+        "naechster_schritt": z.naechster_schritt(status) if status else None,
+        "antwort": text, "antwortzeit_s": antwortzeit,
+    })
 
-    ergebnis = antwort(text, cid=cid, person_id=person_id, person_neu=person_neu,
-                       themen=status_kurz(stand, status), person_name=stand.get("name"))
+    if cfg["zustandsraum"]:
+        kurz = status_kurz(stand, status)
+    else:
+        kurz = z.fakten_kurz(stand)
+    ergebnis = antwort(text, cid=verlauf_key, modus=modus, person_id=person_id, person_neu=person_neu,
+                       themen=kurz, person_name=stand.get("name"))
     if request.test_person_id:
         # Nur im Testmodus: zeigen, was intern passiert ist (fuer chat_test.py)
         ergebnis["debug"] = {"extrahiert": wunsch, "gelernt": gelernt, "abgelehnt": abgelehnt,
-                             "seit_letztem_mal": aenderungen, "neue_interaktion": neue_interaktion, "block": block}
+                             "seit_letztem_mal": aenderungen, "neue_interaktion": neue_interaktion,
+                             "block": block, "antwortzeit_s": antwortzeit}
     return ergebnis
 
 
-@app.get("/gaesteliste/{person_id}")
-def gaesteliste(person_id: str):
-    """Komplette Gaesteliste einer Person ansehen (z.B. /gaesteliste/test_lea)."""
-    anzahl = personen.stand(person_id).get("gaesteliste") or 0
-    return {"person_id": person_id, "anzahl": anzahl,
-            "gaeste": z.gaesteliste_erzeugen(person_id, anzahl)}
+class ResetRequest(BaseModel):
+    teilnehmer_id: str
+    modus: int | None = None   # None = alle Modi
+
+
+@app.post("/sitzung/reset")
+def sitzung_reset(req: ResetRequest):
+    """Chatverlauf (Arbeitsspeicher) einer Teilnehmerin / eines Teilnehmers loeschen.
+    Gespeicherte Planung und ACT-Up-Gedaechtnis bleiben erhalten."""
+    modi = [req.modus] if req.modus else list(MODI)
+    geloescht = [k for k in (f"m{m}:{req.teilnehmer_id}" for m in modi) if history.pop(k, None)]
+    print(f"[Sitzung] Verlauf geloescht: {geloescht or '(nichts)'}")
+    return {"ok": True, "geloescht": geloescht}
+
+
+@app.get("/gaesteliste/{schluessel}")
+def gaesteliste(schluessel: str, modus: int = 1):
+    """Komplette Gaesteliste ansehen, z.B. /gaesteliste/test_lea?modus=1
+    oder /gaesteliste/sitzung_P07?modus=2"""
+    sp = speicher.get(modus)
+    anzahl = (sp.stand(schluessel).get("gaesteliste") or 0) if sp else 0
+    return {"modus": modus, "schluessel": schluessel, "anzahl": anzahl,
+            "gaeste": z.gaesteliste_erzeugen(schluessel, anzahl)}
 
 
 @app.get("/gedaechtnis")
-def gedaechtnis():
-    """Chunk-Tabelle + Planungsstand in der Konsole ausgeben (fuer Demo/Debugging)."""
-    personen.chunk_ausgabe()
+def gedaechtnis(modus: int = 1):
+    """ACT-Up-Chunk-Tabelle eines Modus mit Gedaechtnis in der Konsole ausgeben (1 oder 3)."""
+    if not MODI.get(modus, {}).get("gedaechtnis"):
+        raise HTTPException(status_code=400, detail="Nur Modus 1 und 3 haben ein ACT-Up-Gedaechtnis.")
+    speicher[modus].chunk_ausgabe()
     return {"ok": True}
 
 

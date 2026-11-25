@@ -7,3 +7,5 @@ handlungsraum.json
 interaktionen_log.jsonl
 test_daten_*.json
 test_daten_*.jsonl
+daten/
+test_daten/
